@@ -5,6 +5,20 @@ on:
     tags:
       - 'v*.*.*'
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to upload assets to (e.g. v1.0.22)'
+        required: true
+        type: string
+      build:
+        description: 'Which targets to build'
+        required: true
+        default: hosted
+        type: choice
+        options:
+          - hosted
+          - arm64
+          - all
 
 permissions:
   contents: write
@@ -42,11 +56,13 @@ jobs:
             src-tauri/tauri.conf.json > tmp.json && \
           mv tmp.json src-tauri/tauri.conf.json
 
-      - name: Bump npm version & lockfile
+      - name: Bump package.json version
         shell: bash
         run: |
-          npm install --no-save
-          npm version "${{ steps.extract_version.outputs.version }}" --no-git-tag-version
+          jq --arg v "${{ steps.extract_version.outputs.version }}" \
+            '.version = $v' \
+            package.json > tmp.json && \
+          mv tmp.json package.json
 
       - name: Commit version updates
         uses: stefanzweifel/git-auto-commit-action@v4
@@ -56,18 +72,27 @@ jobs:
 
   publish-tauri:
     needs: sync-version
-    runs-on: ${{ matrix.platform }}
+    if: ${{ always() && (needs.sync-version.result == 'success' || needs.sync-version.result == 'skipped') && (github.event_name != 'workflow_dispatch' || inputs.build != 'arm64') }}
+    runs-on: ${{ matrix.runsOn }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - platform: macos-latest
+          - name: macos-aarch64
+            os: macos
+            runsOn: macos-latest
             args: --target aarch64-apple-darwin
-          - platform: macos-latest
+          - name: macos-x64
+            os: macos
+            runsOn: macos-latest
             args: --target x86_64-apple-darwin
-          - platform: ubuntu-24.04
+          - name: linux-x64
+            os: ubuntu
+            runsOn: ubuntu-24.04
             args: ""
-          - platform: windows-latest
+          - name: windows
+            os: windows
+            runsOn: windows-latest
             args: ""
     steps:
       - name: Checkout updated main
@@ -80,14 +105,34 @@ jobs:
         with:
           node-version: '18'
 
-      - name: Setup Rust toolchain en targets
+      - name: Enable Yarn (Corepack)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$HOME/.local/bin"
+          corepack enable --install-directory "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          corepack prepare yarn@1.22.22 --activate
+
+      - name: Verify Yarn
+        shell: bash
+        run: |
+          set -euxo pipefail
+          yarn --version
+
+      - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Add Rust targets (macOS)
+        if: matrix.os == 'macos'
+        shell: bash
+        run: |
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
       - name: Linux dependencies installeren
-        if: matrix.platform == 'ubuntu-24.04'
+        if: matrix.os == 'ubuntu'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -104,15 +149,21 @@ jobs:
             cpio
 
       - name: Frontend dependencies installeren
-        run: yarn install
+        run: yarn install --frozen-lockfile
+
+      - name: Verify Tauri CLI
+        shell: bash
+        run: |
+          set -euxo pipefail
+          yarn tauri --version
 
       - name: Build en release via tauri-action
         uses: tauri-apps/tauri-action@v0.5.22
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: "App ${{ github.ref_name }}"
+          tagName: ${{ inputs.tag || github.ref_name }}
+          releaseName: "App ${{ inputs.tag || github.ref_name }}"
           releaseBody: "Download de installatie via de assets."
           releaseDraft: false
           prerelease: false
@@ -122,3 +173,88 @@ jobs:
           includeRelease: true
           includeUpdaterJson: true
           updaterJsonKeepUniversal: false
+
+  publish-tauri-linux-arm64:
+    name: publish-tauri (linux-arm64, self-hosted)
+    needs: sync-version
+    if: ${{ always() && github.event_name == 'workflow_dispatch' && (inputs.build == 'arm64' || inputs.build == 'all') && (needs.sync-version.result == 'success' || needs.sync-version.result == 'skipped') }}
+    runs-on: [self-hosted, linux, arm64]
+    env:
+      CARGO_BUILD_JOBS: '1'
+    timeout-minutes: 180
+    steps:
+      - name: Checkout updated main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Enable Yarn (Corepack)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$HOME/.local/bin"
+          corepack enable --install-directory "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          corepack prepare yarn@1.22.22 --activate
+
+      - name: Verify Yarn
+        shell: bash
+        run: |
+          set -euxo pipefail
+          yarn --version
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Linux dependencies installeren
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libjavascriptcoregtk-4.1-dev \
+            pkg-config \
+            libsoup-3.0-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            dpkg \
+            fakeroot
+
+      # NOTE: On low-memory ARM boards (e.g. 2GB), this build may OOM.
+      # Recommendation: configure swap locally on the self-hosted runner (swapfile or zram).
+      # Keeping `CARGO_BUILD_JOBS=1` (set above) also helps reduce peak memory.
+
+      - name: Frontend dependencies installeren
+        run: yarn install --frozen-lockfile
+
+      - name: Verify Tauri CLI
+        shell: bash
+        run: |
+          set -euxo pipefail
+          yarn tauri --version
+
+      - name: Build (deb)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          yarn tauri build --target aarch64-unknown-linux-gnu --bundles deb
+
+      - name: Upload deb to GitHub Release
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ inputs.tag }}
+          name: "App ${{ inputs.tag }}"
+          body: "Download de installatie via de assets."
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
+          files: |
+            src-tauri/target/aarch64-unknown-linux-gnu/release/bundle/deb/*.deb
